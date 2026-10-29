@@ -5,6 +5,9 @@
 ```
  RGB image ─► [1] Grayscale ─► [2] Histogram equalization ─► [3] Gaussian blur ─► [4] Sobel edges
                                    (histogram → LUT → apply)      (naive / separable)
+                                                                        │
+                    Feature extraction (on the blurred image) ◄─────────┘
+                    [5] Harris corners ─► [6] FAST corners ─► [7] ORB descriptors ─► [8] Canny edges
 ```
 
 The project exercises the core skills of CUDA programming:
@@ -15,6 +18,9 @@ The project exercises the core skills of CUDA programming:
 | Shared-memory atomics, parallel prefix sum (scan) | `src/gpu/histogram.cu` |
 | Constant memory, shared-memory tiling with halo, naive vs optimized | `src/gpu/blur.cu` |
 | 2D tiling, `__syncthreads()` rules | `src/gpu/sobel.cu` |
+| Stream compaction with atomics (keypoint lists), 64-bit integer math | `src/gpu/keypoints.cuh`, `src/gpu/harris.cu`, `src/gpu/fast.cu` |
+| One warp per item, warp shuffles (`__shfl_down_sync`), grid-stride over a GPU-side count | `src/gpu/orb.cu` |
+| Iterative flood fill, `__syncthreads_or`, host-checked convergence loop | `src/gpu/canny.cu` |
 | **Jetson memory modes** (device / managed / zero-copy) | `include/gpu_buffer.hpp` |
 | Streams + CUDA-event timing without extra syncs | `src/pipeline.cpp` |
 | Bit-exact host/device shared code (`__host__ __device__`) | `include/common.hpp` |
@@ -38,18 +44,29 @@ orin_vision/
 │   ├── cpu_filters.hpp       CPU reference declarations
 │   ├── pipeline.hpp          GpuPipeline class
 │   ├── image.hpp             Image struct + image loading (JPG/PNG/PPM...) and PPM/PGM saving
+│   ├── platform.hpp          Jetson / PC detection at run time
 │   └── verify.hpp            GPU-vs-CPU comparison
 ├── src/
 │   ├── main.cpp              Command-line app (benchmark, report, CSV)
 │   ├── pipeline.cpp          Runs the stages and times them
+│   ├── platform.cpp          Jetson / PC detection, start-up checks
 │   ├── cpu_filters.cpp       CPU reference (OpenMP multi-core)
-│   ├── image.cpp             File I/O + synthetic test image
+│   ├── cpu_features.cpp      CPU reference: Harris, FAST, ORB, Canny
+│   ├── image.cpp             File I/O, drawing, synthetic test image
+│   ├── stb_image_impl.cpp    Compiles the JPG/PNG decoder
 │   ├── verify.cpp            Stage-isolated verification
 │   └── gpu/
 │       ├── color.cu          RGB → gray
 │       ├── histogram.cu      Histogram, scan, LUT
 │       ├── blur.cu           Gaussian blur (naive + separable)
-│       └── sobel.cu          Sobel edge detection
+│       ├── sobel.cu          Sobel edge detection
+│       ├── gradient.cu       Sobel gradients gx, gy (shared by Harris + Canny)
+│       ├── keypoints.cuh     Peak finding + keypoint list (atomics)
+│       ├── harris.cu         Harris corners
+│       ├── fast.cu           FAST-9 corners
+│       ├── orb.cu            ORB orientation + descriptors (warp per keypoint)
+│       └── canny.cu          Canny edges (NMS + hysteresis)
+├── third_party/stb/          stb_image.h (JPG/PNG decoder, public domain)
 ├── tests/
 │   └── test_pipeline.cpp     ctest: all modes, odd sizes, edge cases
 └── scripts/
@@ -105,7 +122,7 @@ Expected end of the test output:
 
 ```
 ... 
-142 / 142 checks passed
+325 / 325 checks passed
 100% tests passed, 0 tests failed out of 1
 ```
 
@@ -159,6 +176,41 @@ Color images become RGB (a PNG alpha channel is ignored); gray images are used a
 ./build/orin_vision -i photo.jpg
 ./build/orin_vision -i screenshot.png -o out
 ```
+
+### Feature extraction
+
+After Sobel, four feature extractors run **one after another** on the blurred image. All four are on by default.
+
+| # | Feature | What it finds | How it works on the GPU | Output file |
+|---|---|---|---|---|
+| 5 | **Harris** | corners (change in 2 directions) | Sobel gradients → 3×3 structure tensor in a shared tile → `R = det − k·trace²` (integer, k = 1/25) → 3×3 peak → keypoint list via `atomicAdd` | `6_harris.ppm` (green +) |
+| 6 | **FAST-9** | corners, very cheap test | 16-pixel ring (radius 3) from a shared tile, ≥ 9 contiguous brighter/darker pixels → score → same peak + list kernel | `7_fast.ppm` (red +) |
+| 7 | **ORB** | FAST corners + 256-bit descriptor | **one warp per corner**: orientation from intensity centroid (row sums + `__shfl_down_sync`), 30 angle bins, rotated BRIEF pattern, each lane writes 1 descriptor byte | `8_orb.ppm` (circle + angle line), `orb_features.csv` |
+| 8 | **Canny** | thin, connected edge lines | shared Sobel gradients → direction-aware thinning → weak/strong thresholds → hysteresis flood fill repeated until a GPU "changed" flag stays 0 | `5_canny.pgm` |
+
+```bash
+./build/orin_vision -i photo.jpg                       # all features (default)
+./build/orin_vision -i photo.jpg -f harris,canny       # only some of them
+./build/orin_vision -i photo.jpg -f orb                # FAST + ORB (ORB needs FAST)
+./build/orin_vision -f none                            # original pipeline only
+./build/orin_vision -i photo.jpg --fast-thresh 30      # fewer, stronger FAST corners
+./build/orin_vision -i photo.jpg --canny-low 20 --canny-high 60   # more edges
+./build/orin_vision -i photo.jpg --harris-thresh 1e10  # fewer Harris corners
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-f, --features` | `all` | `all`, `none`, or a comma list of `harris,fast,orb,canny` |
+| `--harris-thresh` | `5e9` | threshold on 25·R; higher → fewer corners |
+| `--fast-thresh` | `20` | brightness difference to the center pixel |
+| `--canny-low` / `--canny-high` | `40` / `100` | Sobel gradient magnitude for weak / strong edges |
+| `--max-keypoints` | `16384` | list capacity per detector; the report warns if it was too small |
+
+**Verification:** each feature is checked against the CPU on the same (GPU-blurred) input and must match **exactly**: same keypoints (the GPU list is in random atomic order, so it is sorted first), same ORB angle and all 256 bits, same Canny pixels. The GPU math is bit-exact because every formula is integer-only and shared through `include/common.hpp`. Even ORB's angle avoids `atan2`: it uses an integer dot-product search over 30 directions instead.
+
+`orb_features.csv` has one row per ORB feature: `x, y, angle_deg, descriptor_hex` (64 hex characters = 256 bits). Compare two descriptors by counting differing bits (Hamming distance): fewer than about 40 differing bits usually means the same physical point. This is the starting point for image matching, stitching or visual odometry.
+
+> Learning note: Canny is the only stage where the CPU waits mid-frame. It checks the hysteresis "changed" flag after each round, so Canny is slow compared to its amount of work. Try a bigger image and watch the round count grow. An idea to explore: run several rounds per launch, or use CUDA Graphs.
 
 ---
 
@@ -279,7 +331,8 @@ compute-sanitizer --tool racecheck ./build/orin_vision -g 640x480 -n 1 -w 0
 - **CUDA Graphs** to cut launch overhead for small images
 - **Camera input** with GStreamer / `nvarguscamerasrc`, saving processed frames
 - **Compare with libraries**: NPP or VPI implementations of the same filters
-- **Canny edge detector** (adds non-maximum suppression + hysteresis)
+- **Feature matching**: match ORB descriptors between two frames (Hamming distance with `__popc`) → image stitching / visual odometry
+- **Faster keypoint lists**: warp-aggregated atomics (one `atomicAdd` per warp instead of per pixel)
 
 ### Adding a new stage
 
@@ -298,7 +351,7 @@ compute-sanitizer --tool racecheck ./build/orin_vision -g 640x480 -n 1 -w 0
 | `nvcc not found` | `export PATH=/usr/local/cuda/bin:$PATH` (build.sh does this) |
 | `cmake: command not found` | `sudo apt install cmake` |
 | Build fails with "unsupported gpu architecture" | Your CUDA is too old; check `nvcc --version` |
-| `CUDA ERROR ... out of memory` | 4K needs ~100–150 MB; close other GPU programs, check `jtop` |
+| `CUDA ERROR ... out of memory` | 4K needs ~300 MB with all features (~100–150 MB with `-f none`); close other GPU programs, check `jtop` |
 | Segfault in managed mode after editing code | You touched managed memory while a kernel was running. Sync first |
 | Numbers change a lot between runs | `sudo jetson_clocks`, check temperature/throttling in `jtop` |
 | Charts not created | `sudo apt install python3-matplotlib` |
@@ -335,6 +388,7 @@ cd OrinVision                 # Jetson: ~/jetson_gpu_programing/orin_vision
 ./build/orin_vision -i photo.jpg -o out      # your own image (jpg, png, bmp, ppm...), results in out/
 ./build/orin_vision -m zerocopy              # force a memory mode (auto|device|managed|zerocopy)
 ./build/orin_vision -b naive                 # slow blur, to compare with separable
+./build/orin_vision -f harris,orb            # choose features (harris,fast,orb,canny | all | none)
 ./build/orin_vision -q --csv results/my.csv  # one summary line + append timings to CSV
 ```
 

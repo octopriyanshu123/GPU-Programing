@@ -114,7 +114,8 @@ void sobel(const uint8_t* in, uint8_t* out, int width, int height) {
 }
 
 void runPipeline(const Image& rgb, const std::vector<float>& weights,
-                 PipelineOutputs& out, double stageMs[kNumStages]) {
+                 const FeatureConfig& features, PipelineOutputs& out,
+                 double stageMs[kNumStages]) {
     using clock = std::chrono::steady_clock;
     auto msSince = [](clock::time_point t0) {
         return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
@@ -153,6 +154,37 @@ void runPipeline(const Image& rgb, const std::vector<float>& weights,
     t = clock::now();
     sobel(out.blurred.data.data(), out.edges.data.data(), w, h);
     stageMs[kSobel] = msSince(t);
+
+    // ---- Feature extraction (all on the blurred image) ----
+    const uint8_t* blurred = out.blurred.data.data();
+    out.harris.clear();
+    out.fast.clear();
+    out.orb.clear();
+    out.canny = Image();
+
+    if (features.harris) {
+        t = clock::now();
+        out.harris = harris(blurred, w, h, features.harrisThreshold);
+        out.harrisFound = static_cast<unsigned>(out.harris.size());
+        stageMs[kHarris] = msSince(t);
+    }
+    if (features.fast || features.orb) {
+        t = clock::now();
+        out.fast = fast(blurred, w, h, features.fastThreshold);
+        out.fastFound = static_cast<unsigned>(out.fast.size());
+        stageMs[kFast] = msSince(t);
+    }
+    if (features.orb) {
+        t = clock::now();
+        out.orb = orb(blurred, w, h, out.fast);
+        stageMs[kOrb] = msSince(t);
+    }
+    if (features.canny) {
+        t = clock::now();
+        out.canny = Image(w, h, 1);
+        canny(blurred, out.canny.data.data(), w, h, features.cannyLow, features.cannyHigh);
+        stageMs[kCanny] = msSince(t);
+    }
 }
 
 }  // namespace cpu

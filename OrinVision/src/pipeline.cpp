@@ -3,9 +3,11 @@
 // =====================================================================
 #include "pipeline.hpp"
 
+#include "cpu_filters.hpp"   // cpu::orbTables() (same ORB pattern on CPU and GPU)
 #include "cuda_utils.hpp"
 #include "gpu_filters.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -40,6 +42,36 @@ GpuPipeline::GpuPipeline(const PipelineConfig& config)
     weights_ = makeGaussianWeights(cfg_.blurRadius, cfg_.blurSigma);
     gpu::setGaussianWeights(weights_);
 
+    // ---- Feature extraction buffers (only for the enabled features) ----
+    FeatureConfig& f = cfg_.features;
+    if (f.orb) f.fast = true;                 // ORB describes the FAST corners
+    if (f.maxKeypoints < 1) throw std::invalid_argument("maxKeypoints must be >= 1");
+    const size_t cap = static_cast<size_t>(f.maxKeypoints);
+
+    kpCounts_.allocate(2, m);
+    if (f.harris || f.canny) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gradX_), n * sizeof(int16_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gradY_), n * sizeof(int16_t)));
+    }
+    if (f.harris) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&harrisResp_), n * sizeof(long long)));
+        harrisKps_.allocate(cap, m);
+    }
+    if (f.fast) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&fastScore_), n * sizeof(int)));
+        fastKps_.allocate(cap, m);
+    }
+    if (f.orb) {
+        orb_.allocate(cap, m);
+        gpu::setOrbTables(cpu::orbTables());
+    }
+    if (f.canny) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&cannyClasses_), n));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&cannyChangedDev_), sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&cannyChangedHost_), sizeof(int)));
+        canny_.allocate(n, m);
+    }
+
     CUDA_CHECK(cudaStreamCreate(&stream_));
     for (auto& e : events_) CUDA_CHECK(cudaEventCreate(&e));
 }
@@ -51,6 +83,13 @@ GpuPipeline::~GpuPipeline() {
     cudaFree(hist_);
     cudaFree(lut_);
     cudaFree(blurTmp_);
+    cudaFree(gradX_);
+    cudaFree(gradY_);
+    cudaFree(harrisResp_);
+    cudaFree(fastScore_);
+    cudaFree(cannyClasses_);
+    cudaFree(cannyChangedDev_);
+    cudaFreeHost(cannyChangedHost_);
 }
 
 StageTimings GpuPipeline::process(const Image& rgb, PipelineOutputs* out) {
@@ -92,11 +131,45 @@ StageTimings GpuPipeline::process(const Image& rgb, PipelineOutputs* out) {
     CUDA_CHECK(cudaEventRecord(events_[kSobel], stream_));
     gpu::sobel(blurred_.device(), edges_.device(), w, h, stream_);
 
+    // ---------------- Feature extraction ----------------
+    // Disabled features still record their event, so they show up as ~0 ms.
+    const FeatureConfig& f = cfg_.features;
+    const int cap = f.maxKeypoints;
+
+    CUDA_CHECK(cudaEventRecord(events_[kHarris], stream_));
+    CUDA_CHECK(cudaMemsetAsync(kpCounts_.device(), 0, kpCounts_.bytes(), stream_));
+    if (f.harris || f.canny)   // gradients are shared: computed once, timed here
+        gpu::sobelGradients(blurred_.device(), gradX_, gradY_, w, h, stream_);
+    if (f.harris)
+        gpu::harris(gradX_, gradY_, harrisResp_, w, h, f.harrisThreshold, harrisKps_.device(),
+                    kpCounts_.device() + 0, cap, stream_);
+
+    CUDA_CHECK(cudaEventRecord(events_[kFast], stream_));
+    if (f.fast)
+        gpu::fast(blurred_.device(), fastScore_, w, h, f.fastThreshold, fastKps_.device(),
+                  kpCounts_.device() + 1, cap, stream_);
+
+    CUDA_CHECK(cudaEventRecord(events_[kOrb], stream_));
+    if (f.orb)
+        gpu::orb(blurred_.device(), w, h, fastKps_.device(), kpCounts_.device() + 1, cap,
+                 orb_.device(), stream_);
+
+    CUDA_CHECK(cudaEventRecord(events_[kCanny], stream_));
+    if (f.canny)
+        gpu::canny(gradX_, gradY_, cannyClasses_, canny_.device(), w, h, f.cannyLow,
+                   f.cannyHigh, cannyChangedDev_, cannyChangedHost_, stream_);
+
     CUDA_CHECK(cudaEventRecord(events_[kDownload], stream_));
     gray_.toHost(stream_);
     equalized_.toHost(stream_);
     blurred_.toHost(stream_);
     edges_.toHost(stream_);
+    // Feature buffers (no-ops for disabled features: they are empty)
+    kpCounts_.toHost(stream_);
+    harrisKps_.toHost(stream_);
+    fastKps_.toHost(stream_);
+    orb_.toHost(stream_);
+    canny_.toHost(stream_);
 
     CUDA_CHECK(cudaEventRecord(events_[kNumStages], stream_));
     CUDA_CHECK(cudaEventSynchronize(events_[kNumStages]));
@@ -120,6 +193,24 @@ StageTimings GpuPipeline::process(const Image& rgb, PipelineOutputs* out) {
         copyOut(equalized_, out->equalized);
         copyOut(blurred_, out->blurred);
         copyOut(edges_, out->edges);
+
+        // Keypoint lists: the GPU counted ALL keypoints, but stored at most `cap`
+        const unsigned* counts = kpCounts_.host();
+        auto copyList = [](const auto& buf, size_t count, auto& dst) {
+            dst.assign(buf.host(), buf.host() + count);
+        };
+        out->harrisFound = f.harris ? counts[0] : 0;
+        out->fastFound = f.fast ? counts[1] : 0;
+        const size_t nHarris = std::min<size_t>(out->harrisFound, cap);
+        const size_t nFast = std::min<size_t>(out->fastFound, cap);
+        out->harris.clear();
+        out->fast.clear();
+        out->orb.clear();
+        out->canny = Image();
+        if (f.harris) copyList(harrisKps_, nHarris, out->harris);
+        if (f.fast) copyList(fastKps_, nFast, out->fast);
+        if (f.orb) copyList(orb_, nFast, out->orb);
+        if (f.canny) copyOut(canny_, out->canny);
     }
     return t;
 }

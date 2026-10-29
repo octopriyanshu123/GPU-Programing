@@ -44,4 +44,10 @@ Image generateTestImage(int width, int height, unsigned seed = 42);
 // Expand a 1-channel image to 3 channels (R = G = B).
 Image grayToRgb(const Image& gray);
 
+// Simple drawing on an RGB image (used to show detected features).
+// Everything outside the image is clipped.
+void drawCross(Image& rgb, int x, int y, int size, uint8_t r, uint8_t g, uint8_t b);
+void drawCircle(Image& rgb, int cx, int cy, int radius, uint8_t r, uint8_t g, uint8_t b);
+void drawLine(Image& rgb, int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b);
+
 }  // namespace imageio

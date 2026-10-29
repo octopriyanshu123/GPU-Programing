@@ -4,7 +4,8 @@ Context for Claude / Claude Code when working on this project.
 
 ## What this is
 CUDA C++ image-processing pipeline + benchmark for **Jetson Orin** (sm_87, CUDA 12.6, JetPack 6.x, 8 GB shared RAM).
-Pipeline: RGB → grayscale → histogram equalization → Gaussian blur (naive | separable) → Sobel edges.
+Pipeline: RGB → grayscale → histogram equalization → Gaussian blur (naive | separable) → Sobel edges,
+then feature extraction on the blurred image: Harris → FAST → ORB → Canny (`-f/--features`, default all).
 The user is learning GPU programming; explain changes simply and keep heavy code comments.
 
 ## Environment
@@ -30,6 +31,8 @@ python3 scripts/convert_images.py results   # PGM -> PNG + overview.png
 - Every CUDA call wrapped in `CUDA_CHECK`; `CUDA_CHECK_LAST()` after each launch.
 - No early `return` before `__syncthreads()` in kernels.
 - Verification is stage-isolated (`src/verify.cpp`). Tolerance: 0 everywhere except blur = 1 (FMA rounding).
+- Features must stay bit-exact: integer-only math in `common.hpp` (Harris uses 25·R in int64, ORB angle = integer dot-product over 30 bins, no atan2). GPU keypoint lists are in atomic order → verification sorts them; ORB is verified on the GPU's own FAST list.
+- Canny hysteresis is the one exception to "one sync at the end": the host reads a changed-flag per round (`gpu::canny`).
 - New stage checklist: README section "Adding a new stage".
 
 ## Conventions
@@ -39,4 +42,5 @@ python3 scripts/convert_images.py results   # PGM -> PNG + overview.png
 
 ## Status / next ideas
 - v1.0: all stages, 3 memory modes, 2 blur modes, tests, benchmark scripts, charts.
-- Ideas: FP16 blur, kernel fusion (gray+histogram), multi-stream frames, CUDA Graphs, camera input, NPP/VPI comparison, Canny.
+- v1.1: runs on Jetson + PC (run-time detection), JPG/PNG input (stb_image), feature extraction (Harris, FAST, ORB, Canny).
+- Ideas: FP16 blur, kernel fusion (gray+histogram), multi-stream frames, CUDA Graphs, camera input, NPP/VPI comparison, ORB matching, warp-aggregated atomics.

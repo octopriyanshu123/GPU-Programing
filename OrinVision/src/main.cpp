@@ -15,6 +15,7 @@
 #include "verify.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -40,7 +41,29 @@ struct Options {
     int radius = 4;
     float sigma = 0.0f;
     bool runCpu = true, verify = true, save = true, quiet = false;
+    FeatureConfig features;         // Harris / FAST / ORB / Canny
 };
+
+// "all", "none" or a comma list like "harris,orb"
+void parseFeatureList(const std::string& s, FeatureConfig& f) {
+    f.harris = f.fast = f.orb = f.canny = false;
+    if (s == "all") { f.harris = f.fast = f.orb = f.canny = true; return; }
+    if (s == "none") return;
+    size_t start = 0;
+    while (start <= s.size()) {
+        const size_t comma = s.find(',', start);
+        const std::string item = s.substr(start, comma == std::string::npos ? std::string::npos
+                                                                            : comma - start);
+        if (item == "harris") f.harris = true;
+        else if (item == "fast") f.fast = true;
+        else if (item == "orb") f.orb = f.fast = true;   // ORB needs FAST corners
+        else if (item == "canny") f.canny = true;
+        else throw std::runtime_error("unknown feature: '" + item +
+                                      "' (use harris, fast, orb, canny, all or none)");
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+}
 
 void printUsage(const char* prog) {
     std::printf(
@@ -55,6 +78,14 @@ void printUsage(const char* prog) {
         "  -b, --blur MODE       naive | separable             (default separable)\n"
         "  -r, --radius R        blur radius 1..%d             (default 4)\n"
         "  -s, --sigma S         blur sigma, 0 = radius/2      (default 0)\n\n"
+        "Feature extraction (runs on the blurred image):\n"
+        "  -f, --features LIST   all | none | comma list of harris,fast,orb,canny\n"
+        "                        (default all; orb also runs fast)\n"
+        "      --harris-thresh T Harris threshold on 25*R      (default %.0e)\n"
+        "      --fast-thresh T   FAST brightness threshold     (default %d)\n"
+        "      --canny-low T     Canny weak-edge gradient      (default %d)\n"
+        "      --canny-high T    Canny strong-edge gradient    (default %d)\n"
+        "      --max-keypoints N keypoint list size per detector (default %d)\n\n"
         "Benchmark:\n"
         "  -n, --iters N         timed GPU iterations          (default 20)\n"
         "  -w, --warmup N        untimed warm-up iterations    (default 3)\n"
@@ -70,8 +101,11 @@ void printUsage(const char* prog) {
         "Examples:\n"
         "  %s                                   # 1080p test image, defaults\n"
         "  %s -g 3840x2160 -m device -n 50      # 4K, classic cudaMemcpy mode\n"
-        "  %s -i photo.ppm -r 6 -o out          # your own image\n",
-        prog, kMaxBlurRadius, prog, prog, prog);
+        "  %s -i photo.jpg -r 6 -o out          # your own image\n"
+        "  %s -i photo.jpg -f orb               # only FAST + ORB features\n",
+        prog, kMaxBlurRadius, (double)FeatureConfig{}.harrisThreshold,
+        FeatureConfig{}.fastThreshold, FeatureConfig{}.cannyLow, FeatureConfig{}.cannyHigh,
+        FeatureConfig{}.maxKeypoints, prog, prog, prog, prog);
 }
 
 bool parseSize(const std::string& s, int& w, int& h) {
@@ -127,6 +161,19 @@ int parseArgs(int argc, char** argv, Options& o) {
             try { o.sigma = std::stof(value("--sigma")); }
             catch (...) { throw std::runtime_error("invalid --sigma"); }
         }
+        else if (a == "-f" || a == "--features") parseFeatureList(value("--features"), o.features);
+        else if (a == "--harris-thresh") {
+            double t = 0;
+            try { t = std::stod(value("--harris-thresh")); }
+            catch (...) { throw std::runtime_error("invalid --harris-thresh"); }
+            if (t < 0 || t > 1e18) throw std::runtime_error("--harris-thresh must be 0 .. 1e18");
+            o.features.harrisThreshold = static_cast<long long>(t);
+        }
+        else if (a == "--fast-thresh") o.features.fastThreshold = intValue("--fast-thresh", 1, 254);
+        else if (a == "--canny-low") o.features.cannyLow = intValue("--canny-low", 0, 1500);
+        else if (a == "--canny-high") o.features.cannyHigh = intValue("--canny-high", 0, 1500);
+        else if (a == "--max-keypoints")
+            o.features.maxKeypoints = intValue("--max-keypoints", 1, 1 << 22);
         else if (a == "-n" || a == "--iters") o.iters = intValue("--iters", 1, 100000);
         else if (a == "-w" || a == "--warmup") o.warmup = intValue("--warmup", 0, 1000);
         else if (a == "--cpu-iters") o.cpuIters = intValue("--cpu-iters", 1, 1000);
@@ -138,6 +185,8 @@ int parseArgs(int argc, char** argv, Options& o) {
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else throw std::runtime_error("unknown option: " + a + "  (use --help)");
     }
+    if (o.features.cannyLow > o.features.cannyHigh)
+        throw std::runtime_error("--canny-low must not be larger than --canny-high");
     return 0;
 }
 
@@ -159,6 +208,8 @@ double stageBytes(int stage, size_t n, MemoryMode mem) {
         case kApplyLut:  return 2.0 * n;
         case kBlur:      return 2.0 * n;
         case kSobel:     return 2.0 * n;
+        case kFast:      return 1.0 * n;   // read the image (keypoint list is tiny)
+        case kCanny:     return 2.0 * n;   // read gradients-ish + write edges (lower bound)
         case kDownload:  return mem == MemoryMode::Device ? 4.0 * n : 0.0;
         default:         return 0.0;
     }
@@ -204,6 +255,46 @@ void saveImage(const fs::path& path, const Image& img) {
         std::fprintf(stderr, "warning: %s\n", err.c_str());
 }
 
+// Draw the detected features on top of the input image and save them,
+// plus a CSV with every ORB descriptor (for matching experiments later).
+void saveFeatures(const fs::path& dir, const Image& rgb, const PipelineOutputs& out,
+                  const FeatureConfig& f) {
+    if (f.canny) saveImage(dir / "5_canny.pgm", out.canny);
+    if (f.harris) {
+        Image img = rgb;
+        for (const Keypoint& k : out.harris) imageio::drawCross(img, k.x, k.y, 4, 0, 255, 0);
+        saveImage(dir / "6_harris.ppm", img);
+    }
+    if (f.fast) {
+        Image img = rgb;
+        for (const Keypoint& k : out.fast) imageio::drawCross(img, k.x, k.y, 3, 255, 0, 0);
+        saveImage(dir / "7_fast.ppm", img);
+    }
+    if (f.orb) {
+        // Circle = patch used for the descriptor, line = orientation
+        Image img = rgb;
+        std::ofstream csv(dir / "orb_features.csv");
+        csv << "x,y,angle_deg,descriptor_hex\n";
+        for (const OrbFeature& o : out.orb) {
+            if (o.angleBin < 0) continue;
+            const double a = 2.0 * 3.14159265358979 * o.angleBin / kOrbBins;
+            const int ex = o.x + static_cast<int>(std::lround(kOrbPatchRadius * std::cos(a)));
+            const int ey = o.y + static_cast<int>(std::lround(kOrbPatchRadius * std::sin(a)));
+            imageio::drawCircle(img, o.x, o.y, kOrbPatchRadius, 255, 200, 0);
+            imageio::drawLine(img, o.x, o.y, ex, ey, 255, 0, 255);
+            char hex[2 * kOrbBytes + 1];
+            for (int b = 0; b < kOrbBytes; ++b) std::snprintf(hex + 2 * b, 3, "%02x", o.desc[b]);
+            csv << o.x << ',' << o.y << ',' << o.angleBin * (360 / kOrbBins) << ',' << hex << '\n';
+        }
+        saveImage(dir / "8_orb.ppm", img);
+    }
+}
+
+size_t countValidOrb(const std::vector<OrbFeature>& orb) {
+    return static_cast<size_t>(std::count_if(orb.begin(), orb.end(),
+                                             [](const OrbFeature& o) { return o.angleBin >= 0; }));
+}
+
 int run(Options o) {
     initCuda(!o.quiet);
 
@@ -241,6 +332,7 @@ int run(Options o) {
     cfg.blurMode = o.blur;
     cfg.blurRadius = o.radius;
     cfg.blurSigma = o.sigma;
+    cfg.features = o.features;
     GpuPipeline pipeline(cfg);
 
     for (int i = 0; i < o.warmup; ++i) pipeline.process(rgb, nullptr);
@@ -261,7 +353,7 @@ int run(Options o) {
         PipelineOutputs cpuOut;
         double ms[kNumStages];
         for (int i = 0; i < o.cpuIters; ++i) {
-            cpu::runPipeline(rgb, pipeline.weights(), cpuOut, ms);
+            cpu::runPipeline(rgb, pipeline.weights(), o.features, cpuOut, ms);
             for (int s = 0; s < kNumStages; ++s) cpu[s].add(ms[s]);
         }
         for (int s = 0; s < kNumStages; ++s) cpuTotal += cpu[s].avg();
@@ -271,16 +363,16 @@ int run(Options o) {
     VerifyReport rep;
     bool verified = false;
     if (o.verify) {
-        rep = verifyStages(rgb, gpuOut, pipeline.weights());
+        rep = verifyStages(rgb, gpuOut, pipeline.weights(), o.features);
         verified = rep.allPass();
     }
 
     // ---------------- Report ----------------
     const double fps = gpuTotal.avg() > 0 ? 1000.0 / gpuTotal.avg() : 0.0;
     if (!o.quiet) {
-        std::printf("%-15s %11s %11s %11s %9s %13s\n", "Stage", "GPU avg ms", "GPU min ms",
+        std::printf("%-16s %11s %11s %11s %9s %13s\n", "Stage", "GPU avg ms", "GPU min ms",
                     "CPU ms", "Speedup", "Eff. BW GB/s");
-        std::printf("%s\n", std::string(75, '-').c_str());
+        std::printf("%s\n", std::string(76, '-').c_str());
         for (int s = 0; s < kNumStages; ++s) {
             const double bytes = stageBytes(s, n, o.mem);
             const bool cpuStage = o.runCpu && s != kUpload && s != kDownload;
@@ -290,29 +382,52 @@ int run(Options o) {
                 std::snprintf(spCol, sizeof(spCol), "%.1fx", cpu[s].avg() / gpu[s].avg());
             if (bytes > 0 && gpu[s].avg() > 0)
                 std::snprintf(bwCol, sizeof(bwCol), "%.1f", bytes / (gpu[s].avg() * 1e6));
-            std::printf("%-15s %11.3f %11.3f %11s %9s %13s\n", stageName(s), gpu[s].avg(),
+            std::printf("%-16s %11.3f %11.3f %11s %9s %13s\n", stageName(s), gpu[s].avg(),
                         gpu[s].minOrZero(), cpuCol, spCol, bwCol);
         }
-        std::printf("%s\n", std::string(75, '-').c_str());
+        std::printf("%s\n", std::string(76, '-').c_str());
         char cpuTot[32] = "-", spTot[32] = "-";
         if (o.runCpu) {
             std::snprintf(cpuTot, sizeof(cpuTot), "%.3f", cpuTotal);
             std::snprintf(spTot, sizeof(spTot), "%.1fx", cpuTotal / gpuTotal.avg());
         }
-        std::printf("%-15s %11.3f %11.3f %11s %9s\n\n", "TOTAL", gpuTotal.avg(),
+        std::printf("%-16s %11.3f %11.3f %11s %9s\n\n", "TOTAL", gpuTotal.avg(),
                     gpuTotal.minOrZero(), cpuTot, spTot);
 
         std::printf("Throughput     : %.1f FPS on GPU", fps);
         if (o.runCpu && cpuTotal > 0) std::printf("  vs  %.1f FPS on CPU", 1000.0 / cpuTotal);
         std::printf("\n\n");
 
+        const FeatureConfig& f = o.features;
+        if (f.any()) {
+            std::printf("Features (GPU):\n");
+            auto listLine = [&](const char* name, unsigned found, size_t stored) {
+                std::printf("  %-14s %u found", name, found);
+                if (found > stored)
+                    std::printf("  (list full: only %zu kept, raise --max-keypoints)", stored);
+                std::printf("\n");
+            };
+            if (f.harris) listLine("harris corners", gpuOut.harrisFound, gpuOut.harris.size());
+            if (f.fast) listLine("fast corners", gpuOut.fastFound, gpuOut.fast.size());
+            if (f.orb)
+                std::printf("  %-14s %zu described (%zu too close to the border)\n", "orb",
+                            countValidOrb(gpuOut.orb), gpuOut.orb.size() - countValidOrb(gpuOut.orb));
+            if (f.canny) {
+                const size_t edgePixels = static_cast<size_t>(
+                    std::count(gpuOut.canny.data.begin(), gpuOut.canny.data.end(), 255));
+                std::printf("  %-14s %zu edge pixels (%.1f%%)\n", "canny edges", edgePixels,
+                            100.0 * edgePixels / n);
+            }
+            std::printf("\n");
+        }
+
         if (o.verify) {
             std::printf("Verification (each GPU stage vs CPU on the same input):\n");
-            for (int i = 0; i < VerifyReport::kCount; ++i) {
-                const CompareResult& r = rep.results[i];
-                std::printf("  %-14s %s  max diff %d (tolerance %d), differing pixels %zu / %zu\n",
-                            rep.names[i], r.pass ? "PASS" : "FAIL", r.maxDiff, r.tolerance,
-                            r.mismatches, r.total);
+            for (const VerifyItem& item : rep.items) {
+                const CompareResult& r = item.result;
+                std::printf("  %-16s %s  max diff %d (tolerance %d), differing %s %zu / %zu\n",
+                            item.name.c_str(), r.pass ? "PASS" : "FAIL", r.maxDiff, r.tolerance,
+                            item.unit, r.mismatches, r.total);
             }
             std::printf("\n");
         }
@@ -327,6 +442,7 @@ int run(Options o) {
         saveImage(dir / "2_equalized.pgm", gpuOut.equalized);
         saveImage(dir / "3_blurred.pgm", gpuOut.blurred);
         saveImage(dir / "4_edges.pgm", gpuOut.edges);
+        saveFeatures(dir, rgb, gpuOut, o.features);
         if (!o.quiet) std::printf("Images saved to: %s/\n", dir.string().c_str());
     }
     if (!o.csv.empty()) {

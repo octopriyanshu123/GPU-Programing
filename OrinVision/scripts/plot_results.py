@@ -21,7 +21,8 @@ matplotlib.use("Agg")  # no display needed
 import matplotlib.pyplot as plt  # noqa: E402
 
 KERNEL_STAGES = ["grayscale", "histogram", "build LUT", "apply LUT",
-                 "gaussian blur", "sobel edges"]
+                 "gaussian blur", "sobel edges",
+                 "harris corners", "fast corners", "orb descriptors", "canny edges"]
 ALL_STAGES = ["upload"] + KERNEL_STAGES + ["download"]
 
 

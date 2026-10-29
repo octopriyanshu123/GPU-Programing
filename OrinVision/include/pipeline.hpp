@@ -26,6 +26,7 @@ struct PipelineConfig {
     BlurMode blurMode = BlurMode::Separable;
     int blurRadius = 4;        // 1 .. kMaxBlurRadius
     float blurSigma = 0.0f;    // <= 0 means "radius / 2"
+    FeatureConfig features;    // Harris / FAST / ORB / Canny on the blurred image
 };
 
 struct StageTimings {
@@ -55,10 +56,23 @@ private:
     // Buffers the CPU reads or writes: they follow the chosen memory mode.
     GpuBuffer<uint8_t> rgb_, gray_, equalized_, blurred_, edges_;
 
+    // Feature results (CPU-visible, follow the memory mode too).
+    GpuBuffer<unsigned> kpCounts_;            // [0] Harris found, [1] FAST found
+    GpuBuffer<Keypoint> harrisKps_, fastKps_;
+    GpuBuffer<OrbFeature> orb_;
+    GpuBuffer<uint8_t> canny_;
+
     // GPU-only scratch buffers: always plain device memory.
     unsigned* hist_ = nullptr;     // 256 bins
     uint8_t* lut_ = nullptr;       // 256 entries
     float* blurTmp_ = nullptr;     // separable blur intermediate
+    int16_t* gradX_ = nullptr;     // Sobel gradients (Harris + Canny)
+    int16_t* gradY_ = nullptr;
+    long long* harrisResp_ = nullptr;
+    int* fastScore_ = nullptr;
+    uint8_t* cannyClasses_ = nullptr;
+    int* cannyChangedDev_ = nullptr;    // hysteresis "something changed" flag
+    int* cannyChangedHost_ = nullptr;   // pinned copy the CPU reads
 
     cudaStream_t stream_ = nullptr;
     cudaEvent_t events_[kNumStages + 1] = {};

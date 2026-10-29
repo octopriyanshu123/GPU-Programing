@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 
 #include "stb_image.h"   // third_party/stb: JPG / PNG / BMP decoder
@@ -185,6 +186,48 @@ Image grayToRgb(const Image& gray) {
     for (size_t i = 0; i < gray.pixels(); ++i)
         rgb.data[i * 3] = rgb.data[i * 3 + 1] = rgb.data[i * 3 + 2] = gray.data[i];
     return rgb;
+}
+
+namespace {
+void putPixel(Image& img, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    if (x < 0 || y < 0 || x >= img.width || y >= img.height || img.channels != 3) return;
+    uint8_t* p = &img.data[(size_t(y) * img.width + x) * 3];
+    p[0] = r; p[1] = g; p[2] = b;
+}
+}  // namespace
+
+void drawCross(Image& rgb, int x, int y, int size, uint8_t r, uint8_t g, uint8_t b) {
+    for (int d = -size; d <= size; ++d) {
+        putPixel(rgb, x + d, y, r, g, b);
+        putPixel(rgb, x, y + d, r, g, b);
+    }
+}
+
+void drawLine(Image& rgb, int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+    // Bresenham's line algorithm
+    const int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    const int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (true) {
+        putPixel(rgb, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        const int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+void drawCircle(Image& rgb, int cx, int cy, int radius, uint8_t r, uint8_t g, uint8_t b) {
+    // Midpoint circle algorithm: 8 symmetric points per step
+    int x = radius, y = 0, err = 1 - radius;
+    while (x >= y) {
+        const int pts[8][2] = {{x, y}, {y, x}, {-y, x}, {-x, y},
+                               {-x, -y}, {-y, -x}, {y, -x}, {x, -y}};
+        for (const auto& p : pts) putPixel(rgb, cx + p[0], cy + p[1], r, g, b);
+        ++y;
+        if (err < 0) err += 2 * y + 1;
+        else { --x; err += 2 * (y - x) + 1; }
+    }
 }
 
 }  // namespace imageio

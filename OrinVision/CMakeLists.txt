@@ -53,6 +53,7 @@ find_package(OpenMP)   # optional: multi-core CPU reference
 add_library(orin_core STATIC
     src/image.cpp
     src/cpu_filters.cpp
+    src/cpu_features.cpp
     src/verify.cpp
     src/pipeline.cpp
     src/platform.cpp
@@ -61,6 +62,12 @@ add_library(orin_core STATIC
     src/gpu/histogram.cu
     src/gpu/blur.cu
     src/gpu/sobel.cu
+    # Feature extraction
+    src/gpu/gradient.cu
+    src/gpu/harris.cu
+    src/gpu/fast.cu
+    src/gpu/orb.cu
+    src/gpu/canny.cu
 )
 target_include_directories(orin_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # stb_image (JPG/PNG decoder): third-party, so silence its warnings

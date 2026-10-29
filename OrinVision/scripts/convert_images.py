@@ -27,6 +27,10 @@ STAGE_FILES = [
     ("2_equalized.pgm", "2. equalized"),
     ("3_blurred.pgm", "3. blurred"),
     ("4_edges.pgm", "4. edges"),
+    ("5_canny.pgm", "5. canny edges"),
+    ("6_harris.ppm", "6. harris corners"),
+    ("7_fast.ppm", "7. FAST corners"),
+    ("8_orb.ppm", "8. ORB features"),
 ]
 
 
