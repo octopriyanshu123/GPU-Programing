@@ -25,6 +25,18 @@ __global__ void rgbToGrayKernel(const uint8_t* __restrict__ rgb,
 
 namespace gpu {
 
+bool kernelsAvailable(std::string& error) {
+    // cudaFuncGetAttributes fails if the binary has no machine code (SASS)
+    // or PTX that this GPU can run. One kernel is enough: all .cu files are
+    // compiled with the same architecture list.
+    cudaFuncAttributes attr{};
+    const cudaError_t err = cudaFuncGetAttributes(&attr, rgbToGrayKernel);
+    if (err == cudaSuccess) return true;
+    cudaGetLastError();   // clear the error so later CUDA calls are not affected
+    error = cudaGetErrorString(err);
+    return false;
+}
+
 void rgbToGray(const uint8_t* rgb, uint8_t* gray, int width, int height,
                cudaStream_t stream) {
     const int n = width * height;

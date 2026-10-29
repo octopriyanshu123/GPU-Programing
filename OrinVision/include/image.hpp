@@ -30,7 +30,8 @@ struct Image {
 
 namespace imageio {
 
-// Load a binary PPM (P6) or PGM (P5) file with max value <= 255.
+// Load JPG, PNG, BMP, TGA, GIF, or a binary PPM (P6) / PGM (P5) file.
+// The format is detected from the file contents, not the extension.
 bool load(const std::string& path, Image& img, std::string& error);
 
 // Save as PGM (1 channel) or PPM (3 channels).

@@ -1,5 +1,6 @@
 # =====================================================================
 # OrinVision - GPU image processing pipeline & benchmark for Jetson Orin
+#              (also builds and runs on a PC / laptop NVIDIA GPU)
 # =====================================================================
 #   ./scripts/build.sh            (or the manual steps below)
 #
@@ -15,10 +16,20 @@ if(NOT DEFINED CMAKE_CUDA_COMPILER AND EXISTS /usr/local/cuda/bin/nvcc)
     set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
 endif()
 
-# Jetson Orin = compute capability 8.7. Override for other GPUs, e.g.
+# Which GPUs to compile kernels for (picked from the build machine):
+#   Jetson (aarch64) : 87 = Orin
+#   PC / laptop      : 75 = RTX 20xx, 86 = RTX 30xx, 89 = RTX 40xx
+# Each number embeds machine code + PTX, so newer GPUs can still JIT it.
+# The program checks at start-up that a matching kernel exists.
+# Override for other GPUs, e.g.
 #   cmake -DCMAKE_CUDA_ARCHITECTURES=72 ..   (Xavier)
+#   cmake -DCMAKE_CUDA_ARCHITECTURES=native ..   (only the GPU in this machine)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 87)
+    if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        set(CMAKE_CUDA_ARCHITECTURES 87)
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+    endif()
 endif()
 
 project(OrinVision VERSION 1.0.0 LANGUAGES CXX CUDA)
@@ -44,12 +55,17 @@ add_library(orin_core STATIC
     src/cpu_filters.cpp
     src/verify.cpp
     src/pipeline.cpp
+    src/platform.cpp
+    src/stb_image_impl.cpp
     src/gpu/color.cu
     src/gpu/histogram.cu
     src/gpu/blur.cu
     src/gpu/sobel.cu
 )
 target_include_directories(orin_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# stb_image (JPG/PNG decoder): third-party, so silence its warnings
+target_include_directories(orin_core SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
+set_source_files_properties(src/stb_image_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_link_libraries(orin_core PUBLIC CUDA::cudart)
 
 if(OpenMP_CXX_FOUND)

@@ -11,9 +11,14 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace gpu {
+
+// True if this binary contains kernel code the current GPU can run
+// (e.g. built for sm_87 but running on an sm_86 laptop GPU -> false).
+bool kernelsAvailable(std::string& error);
 
 // --- src/gpu/color.cu ---
 void rgbToGray(const uint8_t* rgb, uint8_t* gray, int width, int height,

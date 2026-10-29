@@ -35,6 +35,7 @@ struct Options {
     std::string csv;                // empty -> no CSV
     int iters = 20, warmup = 3, cpuIters = 3;
     MemoryMode mem = MemoryMode::Managed;
+    bool memAuto = true;            // pick `mem` from the detected platform
     BlurMode blur = BlurMode::Separable;
     int radius = 4;
     float sigma = 0.0f;
@@ -43,13 +44,14 @@ struct Options {
 
 void printUsage(const char* prog) {
     std::printf(
-        "OrinVision - GPU image processing pipeline & benchmark for Jetson\n\n"
+        "OrinVision - GPU image processing pipeline & benchmark for Jetson and PC GPUs\n\n"
         "Usage: %s [options]\n\n"
         "Input:\n"
-        "  -i, --input FILE      PPM (P6) or PGM (P5) image to process\n"
+        "  -i, --input FILE      image to process: JPG, PNG, BMP, TGA, GIF, PPM, PGM\n"
         "  -g, --generate WxH    generate a synthetic test image (default 1920x1080)\n\n"
         "Pipeline:\n"
-        "  -m, --mem MODE        device | managed | zerocopy   (default managed)\n"
+        "  -m, --mem MODE        auto | device | managed | zerocopy   (default auto:\n"
+        "                        managed on Jetson, device on a PC/laptop GPU)\n"
         "  -b, --blur MODE       naive | separable             (default separable)\n"
         "  -r, --radius R        blur radius 1..%d             (default 4)\n"
         "  -s, --sigma S         blur sigma, 0 = radius/2      (default 0)\n\n"
@@ -110,7 +112,9 @@ int parseArgs(int argc, char** argv, Options& o) {
         }
         else if (a == "-m" || a == "--mem") {
             const std::string v = value("--mem");
-            if (!parseMemoryMode(v, o.mem)) throw std::runtime_error("unknown memory mode: " + v);
+            o.memAuto = (v == "auto");
+            if (!o.memAuto && !parseMemoryMode(v, o.mem))
+                throw std::runtime_error("unknown memory mode: " + v);
         }
         else if (a == "-b" || a == "--blur") {
             const std::string v = value("--blur");
@@ -200,8 +204,11 @@ void saveImage(const fs::path& path, const Image& img) {
         std::fprintf(stderr, "warning: %s\n", err.c_str());
 }
 
-int run(const Options& o) {
+int run(Options o) {
     initCuda(!o.quiet);
+
+    // Run-time platform choice: same kernels, best memory strategy per device.
+    if (o.memAuto) o.mem = defaultMemoryMode(platform());
 
     // ---------------- Input ----------------
     Image rgb;
@@ -221,8 +228,9 @@ int run(const Options& o) {
         std::printf("CPU threads    : %d\n", cpu::numThreads());
         std::printf("Input          : %s (%dx%d, %.1f MPixel)\n", inputName.c_str(), rgb.width,
                     rgb.height, n / 1e6);
-        std::printf("Config         : memory=%s  blur=%s  radius=%d  iters=%d  warmup=%d\n\n",
-                    toString(o.mem), toString(o.blur), o.radius, o.iters, o.warmup);
+        std::printf("Config         : memory=%s%s  blur=%s  radius=%d  iters=%d  warmup=%d\n\n",
+                    toString(o.mem), o.memAuto ? " (auto)" : "", toString(o.blur), o.radius,
+                    o.iters, o.warmup);
     }
 
     // ---------------- GPU benchmark ----------------

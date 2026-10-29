@@ -25,7 +25,8 @@ python3 scripts/convert_images.py results   # PGM -> PNG + overview.png
 - Shared CPU/GPU math lives in `include/common.hpp` as `HD inline` functions → CPU and GPU results are bit-exact.
 - CPU-visible buffers use `GpuBuffer<T>` (memory mode: device | managed | zerocopy). GPU-only scratch uses plain `cudaMalloc`.
 - All kernels run on `GpuPipeline::stream_`; timing via CUDA events between stages; one sync at the end.
-- **Jetson: no concurrent managed access** → `cudaDeviceSynchronize()` before the CPU touches managed memory.
+- Also runs on a PC/laptop GPU (dev machine: RTX 3080, sm_86, CUDA 12.1). Platform is detected at run time in `src/platform.cpp` (`platform()`, `cudaDeviceProp::integrated` + Tegra files); `--mem auto` = managed on Jetson, device on PC. CMake picks arch from host CPU: aarch64 → 87, x86_64 → 75;86;89.
+- **Jetson: no concurrent managed access** → `cudaDeviceSynchronize()` before the CPU touches managed memory (skipped when `concurrentManagedAccess` is true).
 - Every CUDA call wrapped in `CUDA_CHECK`; `CUDA_CHECK_LAST()` after each launch.
 - No early `return` before `__syncthreads()` in kernels.
 - Verification is stage-isolated (`src/verify.cpp`). Tolerance: 0 everywhere except blur = 1 (FMA rounding).

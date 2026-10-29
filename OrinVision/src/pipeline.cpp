@@ -10,33 +10,13 @@
 #include <stdexcept>
 #include <string>
 
-void initCuda(bool printInfo) {
-    // Allow zero-copy (mapped) host memory. Must be set before the CUDA
-    // context is created; on Jetson this is effectively always enabled.
-    cudaError_t err = cudaSetDeviceFlags(cudaDeviceMapHost);
-    if (err != cudaSuccess && err != cudaErrorSetOnActiveProcess) CUDA_CHECK(err);
-    cudaGetLastError();   // clear a possible "already active" error
+// initCuda() lives in src/platform.cpp (Jetson / PC detection).
 
-    int dev = 0;
-    CUDA_CHECK(cudaSetDevice(dev));
-    cudaDeviceProp p{};
-    CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
-
-    if (!printInfo) return;
-    int runtimeVer = 0, driverVer = 0;
-    CUDA_CHECK(cudaRuntimeGetVersion(&runtimeVer));
-    CUDA_CHECK(cudaDriverGetVersion(&driverVer));
-    std::printf("GPU            : %s (compute %d.%d, %d SMs)\n", p.name, p.major, p.minor,
-                p.multiProcessorCount);
-    std::printf("Memory         : %.2f GB %s\n", p.totalGlobalMem / 1e9,
-                p.integrated ? "(shared with CPU - integrated GPU)" : "(dedicated VRAM)");
-    std::printf("CUDA runtime   : %d.%d   driver: %d.%d\n", runtimeVer / 1000,
-                (runtimeVer % 1000) / 10, driverVer / 1000, (driverVer % 1000) / 10);
-    std::printf("Managed memory : concurrent CPU access %s\n",
-                p.concurrentManagedAccess ? "YES" : "NO (sync before CPU access)");
-}
-
-GpuPipeline::GpuPipeline(const PipelineConfig& config) : cfg_(config) {
+GpuPipeline::GpuPipeline(const PipelineConfig& config)
+    : cfg_(config),
+      // Jetson cannot let the CPU touch managed memory while ANY kernel runs;
+      // a laptop GPU can, so the extra device-wide sync is skipped there.
+      deviceSyncBeforeCpu_(!platform().concurrentManagedAccess) {
     if (cfg_.width <= 0 || cfg_.height <= 0)
         throw std::invalid_argument("pipeline size must be positive");
     if (cfg_.blurRadius < 1 || cfg_.blurRadius > kMaxBlurRadius)
@@ -122,8 +102,9 @@ StageTimings GpuPipeline::process(const Image& rgb, PipelineOutputs* out) {
     CUDA_CHECK(cudaEventSynchronize(events_[kNumStages]));
 
     // Jetson has no concurrent managed access: make sure the whole GPU is
-    // idle before the CPU touches managed buffers below.
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // idle before the CPU touches managed buffers below. (On a laptop the
+    // event sync above is enough, because our stream is the only work.)
+    if (deviceSyncBeforeCpu_) CUDA_CHECK(cudaDeviceSynchronize());
 
     StageTimings t;
     for (int s = 0; s < kNumStages; ++s)

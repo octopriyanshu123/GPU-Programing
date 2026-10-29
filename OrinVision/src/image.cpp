@@ -1,5 +1,6 @@
 // =====================================================================
-// image.cpp - PPM/PGM file I/O and a synthetic test image generator
+// image.cpp - Image loading (PPM/PGM + JPG/PNG/BMP via stb_image),
+//             PPM/PGM saving and a synthetic test image generator
 // =====================================================================
 #include "image.hpp"
 
@@ -7,6 +8,8 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+
+#include "stb_image.h"   // third_party/stb: JPG / PNG / BMP decoder
 
 namespace {
 
@@ -38,6 +41,30 @@ bool parsePositiveInt(const std::string& s, int& value) {
     return value > 0;
 }
 
+// JPG, PNG, BMP, TGA, GIF (first frame), PSD via stb_image.
+// Gray files stay 1 channel; color files become RGB (alpha is dropped).
+bool loadCompressed(const std::string& path, Image& img, std::string& error) {
+    int w = 0, h = 0, fileChannels = 0;
+    if (!stbi_info(path.c_str(), &w, &h, &fileChannels)) {
+        error = "unsupported image format (" + std::string(stbi_failure_reason()) +
+                "): " + path + "  - use JPG, PNG, BMP, TGA, GIF, PPM or PGM";
+        return false;
+    }
+    if (size_t(w) * h > size_t(16384) * 16384) { error = "image too large"; return false; }
+
+    const int channels = (fileChannels <= 2) ? 1 : 3;   // 2 = gray + alpha
+    uint8_t* pixels = stbi_load(path.c_str(), &w, &h, &fileChannels, channels);
+    if (!pixels) {
+        error = "cannot decode " + path + ": " + stbi_failure_reason();
+        return false;
+    }
+    Image result(w, h, channels);
+    std::copy(pixels, pixels + result.bytes(), result.data.begin());
+    stbi_image_free(pixels);   // memory was allocated by stb_image
+    img = std::move(result);
+    return true;
+}
+
 }  // namespace
 
 namespace imageio {
@@ -45,6 +72,17 @@ namespace imageio {
 bool load(const std::string& path, Image& img, std::string& error) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { error = "cannot open file: " + path; return false; }
+
+    // Look at the first two bytes, not the file extension: "P5"/"P6" means
+    // PNM (read below by hand), anything else goes to stb_image.
+    char head[2] = {};
+    in.read(head, 2);
+    const bool isPnm = in.gcount() == 2 && head[0] == 'P' && (head[1] == '5' || head[1] == '6');
+    if (!isPnm) {
+        in.close();
+        return loadCompressed(path, img, error);
+    }
+    in.seekg(0);
 
     std::string magic, ws, hs, ms;
     if (!readToken(in, magic) || (magic != "P5" && magic != "P6")) {

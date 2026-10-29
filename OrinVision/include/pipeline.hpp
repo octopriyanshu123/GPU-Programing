@@ -15,6 +15,7 @@
 
 #include "common.hpp"
 #include "gpu_buffer.hpp"
+#include "platform.hpp"
 
 #include <vector>
 
@@ -61,7 +62,7 @@ private:
 
     cudaStream_t stream_ = nullptr;
     cudaEvent_t events_[kNumStages + 1] = {};
-};
 
-// Print GPU information and prepare CUDA (call once at program start).
-void initCuda(bool printInfo);
+    // Decided at run time from platform(): true on Jetson.
+    bool deviceSyncBeforeCpu_ = true;
+};

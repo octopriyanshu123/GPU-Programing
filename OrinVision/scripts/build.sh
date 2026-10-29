@@ -18,7 +18,7 @@ BUILD_DIR="build"
 export PATH="/usr/local/cuda/bin:$PATH"
 
 command -v cmake >/dev/null || { echo "cmake not found: sudo apt install cmake"; exit 1; }
-command -v nvcc  >/dev/null || { echo "nvcc not found: sudo apt install nvidia-jetpack"; exit 1; }
+command -v nvcc  >/dev/null || { echo "nvcc not found: Jetson -> sudo apt install nvidia-jetpack, PC -> install the CUDA Toolkit"; exit 1; }
 
 echo "==> Configuring ($BUILD_TYPE) in $BUILD_DIR/"
 cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"

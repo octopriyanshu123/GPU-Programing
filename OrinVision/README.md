@@ -37,7 +37,7 @@ orin_vision/
 │   ├── gpu_filters.hpp       Kernel launcher declarations
 │   ├── cpu_filters.hpp       CPU reference declarations
 │   ├── pipeline.hpp          GpuPipeline class
-│   ├── image.hpp             Image struct + PPM/PGM I/O
+│   ├── image.hpp             Image struct + image loading (JPG/PNG/PPM...) and PPM/PGM saving
 │   └── verify.hpp            GPU-vs-CPU comparison
 ├── src/
 │   ├── main.cpp              Command-line app (benchmark, report, CSV)
@@ -119,7 +119,7 @@ Expected end of the test output:
 ./build/orin_vision -g 3840x2160 -n 50    # 4K, 50 iterations
 ./build/orin_vision -m device             # classic cudaMalloc + cudaMemcpy
 ./build/orin_vision -b naive              # unoptimized blur, for comparison
-./build/orin_vision -i photo.ppm -r 6     # your own image, stronger blur
+./build/orin_vision -i photo.jpg -r 6     # your own image (jpg/png/ppm...), stronger blur
 ```
 
 Example report layout (your numbers will differ):
@@ -151,9 +151,13 @@ Verification (each GPU stage vs CPU on the same input):
 
 ### Using your own photos
 
+JPG, PNG, BMP, TGA, GIF (first frame), PPM and PGM are read directly — no conversion needed.
+The format is detected from the file contents (decoder: `third_party/stb/stb_image.h`).
+Color images become RGB (a PNG alpha channel is ignored); gray images are used as gray.
+
 ```bash
-python3 scripts/convert_images.py --to-ppm photo.jpg   # creates photo.ppm
-./build/orin_vision -i photo.ppm
+./build/orin_vision -i photo.jpg
+./build/orin_vision -i screenshot.png -o out
 ```
 
 ---
@@ -299,3 +303,46 @@ compute-sanitizer --tool racecheck ./build/orin_vision -g 640x480 -n 1 -w 0
 | Numbers change a lot between runs | `sudo jetson_clocks`, check temperature/throttling in `jtop` |
 | Charts not created | `sudo apt install python3-matplotlib` |
 | SSH disconnect killed the benchmark | Run it inside `tmux` |
+| `the GPU kernels cannot run on ...` / `no kernel image is available` | Binary was built for another GPU (e.g. Jetson build copied to a laptop). Rebuild on this machine: `rm -rf build && ./scripts/build.sh`, or force it with `-DCMAKE_CUDA_ARCHITECTURES=86` (RTX 30xx) / `87` (Orin) / `native` |
+
+---
+
+## 12. How to run the program (Jetson or laptop)
+
+The same code runs on a **Jetson Orin** and on a **PC / laptop with an NVIDIA GPU**.
+At start-up the program detects which one it is on (`src/platform.cpp`) and picks the best settings automatically.
+
+| | Jetson Orin | PC / laptop (e.g. RTX 3080) |
+|---|---|---|
+| Needs | JetPack 6.x (CUDA 12.x) | NVIDIA driver + CUDA Toolkit 12.x, `cmake`, `g++` |
+| Compiled for (automatic) | `sm_87` | `sm_75`, `sm_86`, `sm_89` (RTX 20/30/40) |
+| Default memory mode (`--mem auto`) | `managed` (CPU and GPU share RAM) | `device` (explicit copies to VRAM) |
+| First line of the output | `Platform : Jetson - ...` | `Platform : PC / laptop (discrete GPU)` |
+
+**Step 1 – build** (always build on the machine you run on; a Jetson binary does not run on a laptop and vice versa):
+
+```bash
+cd OrinVision                 # Jetson: ~/jetson_gpu_programing/orin_vision
+./scripts/build.sh            # configure + build + run all tests
+```
+
+**Step 2 – run:**
+
+```bash
+./build/orin_vision                          # 1080p generated test image, auto settings
+./build/orin_vision --help                   # list every option
+./build/orin_vision -g 3840x2160 -n 50       # 4K image, 50 timed iterations
+./build/orin_vision -i photo.jpg -o out      # your own image (jpg, png, bmp, ppm...), results in out/
+./build/orin_vision -m zerocopy              # force a memory mode (auto|device|managed|zerocopy)
+./build/orin_vision -b naive                 # slow blur, to compare with separable
+./build/orin_vision -q --csv results/my.csv  # one summary line + append timings to CSV
+```
+
+**Step 3 – look at the results:**
+
+```bash
+python3 scripts/convert_images.py results    # PGM -> PNG + overview.png
+./scripts/run_benchmarks.sh                  # full sweep (sizes x memory x blur) + charts
+```
+
+The program prints the platform, GPU, per-stage timings, CPU-vs-GPU speedup and a PASS/FAIL check for every stage. It exits with `0` when everything is OK, `1` on an error and `3` if the verification failed.
